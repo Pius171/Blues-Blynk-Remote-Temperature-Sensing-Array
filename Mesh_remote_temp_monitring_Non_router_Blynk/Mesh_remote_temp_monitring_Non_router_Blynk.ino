@@ -8,12 +8,20 @@
 //************************************************************
 #include "painlessMesh.h"
 #include "FS.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <map>
+
+// Data wire is plugged into port 2 on the Arduino
+#define ONE_WIRE_BUS 4
+
+
 
 #define   MESH_PREFIX     "whateverYouLike"
 #define   MESH_PASSWORD   "somethingSneaky"
 #define   MESH_PORT       5555
 
-#define DEBUG 0
+#define DEBUG 1
 
 #if DEBUG == 1
 #define debug(x) Serial.print(x)
@@ -26,6 +34,11 @@
 #define debugf(...)
 #endif
 
+// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
+OneWire oneWire(ONE_WIRE_BUS);
+
+// Pass our oneWire reference to Dallas Temperature. 
+DallasTemperature sensors(&oneWire);
 
 Scheduler userScheduler; // to control your personal task
 painlessMesh  mesh;
@@ -43,9 +56,15 @@ void writeFile(const char * path, String message);
 Task taskSendMessage( TASK_SECOND * 1 , TASK_FOREVER, &sendMessage );
 
 void sendMessage() {
-  int temperature= random(32);
+debug("getting temperature...");
+    sensors.requestTemperatures(); // Send the command to get temperatures
+  debugln("DONE");
+  // After we got the temperatures, we can print them here.
+  // We use the function ByIndex, and as an example get the temperature from the first sensor only.
+  int tempC = (int)sensors.getTempCByIndex(0);
   char msg[50];
-  sprintf(msg, "%02d%s",temperature,DEVICE_NAME.c_str());
+  sprintf(msg, "%02d%s",tempC,DEVICE_NAME.c_str());
+  debugln(msg);
 
   //mesh.sendBroadcast( temperature );
   if(RouterExists){
@@ -100,6 +119,7 @@ void setup() {
 
   userScheduler.addTask( taskSendMessage );
   taskSendMessage.enable();
+   sensors.begin();
 }
 
 void loop() {

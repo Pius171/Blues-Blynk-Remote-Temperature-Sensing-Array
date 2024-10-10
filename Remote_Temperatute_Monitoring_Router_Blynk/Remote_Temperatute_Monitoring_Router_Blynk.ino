@@ -1,12 +1,12 @@
 #include <Notecard.h>
 #include "painlessMesh.h"
 
-#define DEBUG 0
+#define DEBUG 1
 
 #if DEBUG == 1
 #define debug(x) Serial.print(x)
 #define debugln(x) Serial.println(x)
-#define debugf(...) Serial.printf(__VA_ARGS__) // Use variadic macros to allow multiple arguments
+#define debugf(...) Serial.printf(__VA_ARGS__)  // Use variadic macros to allow multiple arguments
 
 #else
 #define debug(x)
@@ -27,23 +27,24 @@
 
 // This is the unique Product Identifier for your device
 #ifndef PRODUCT_UID
-#define PRODUCT_UID ""  // "com.my-company.my-name:my-project"
+#define PRODUCT_UID "com.gmail.onyemandukwu:temperature_monitor"  // "com.my-company.my-name:my-project"
 #pragma message "PRODUCT_UID is not defined in this example. Please ensure your Notecard has a product identifier set before running this example or define it in code here. More details at https://dev.blues.io/tools-and-sdks/samples/product-uid"
 #endif
 
 #define myProductID PRODUCT_UID
-
+#define ATTN_PIN 16
 #define MESH_PREFIX "whateverYouLike"
 #define MESH_PASSWORD "somethingSneaky"
 #define MESH_PORT 5555
 
-const String DEVICE_NAME = "Room 199"; // case sensitive
-const int INTERVAL = 1;  // in seconds check to 60 secs later
+const String DEVICE_NAME = "Room 199";  // case sensitive
+const int INTERVAL = 1;                 // in seconds check to 60 secs later //remove since it will stop sending periodically
 
 Scheduler userScheduler;  // to control your personal task
 painlessMesh mesh;
 Notecard notecard;
 
+std::map<String, int> tempHashMap;
 // User stub
 void sendMessage();
 void sendRouterTemp();
@@ -53,13 +54,13 @@ Task taskSendRouterTemp(TASK_SECOND * 1, TASK_FOREVER, &sendRouterTemp);
 
 void sendMessage() {
   String msg = String(mesh.getNodeId());
-  mesh.sendBroadcast(msg); // sends its id to non router devices, so they can know where to send thier temp reading to
+  mesh.sendBroadcast(msg);  // sends its id to non router devices, so they can know where to send thier temp reading to
 
   taskSendMessage.setInterval(TASK_SECOND * INTERVAL);
 }
 
-void sendRouterTemp(){
-    // send its own temperature to the cloud
+void sendRouterTemp() {
+  // send its own temperature to the cloud
   int temperature = random(32);
 
   J *req = notecard.newRequest("note.add");
@@ -82,17 +83,35 @@ void receivedCallback(uint32_t from, String &msg) {
   int temperature = msg.substring(0, 2).toInt();
   String device_name = msg.substring(2);
 
-  J *req = notecard.newRequest("note.add");
-  if (req != NULL) {
-    JAddStringToObject(req, "file", "temperature.qo");
-    JAddBoolToObject(req, "sync", true);
-    J *body = JAddObjectToObject(req, "body");
-    if (body != NULL) {
-      JAddNumberToObject(body, device_name.c_str(), temperature);
+  tempHashMap[device_name] = temperature;
+
+  if (digitalRead(ATTN_PIN)) {
+    debugln("blynk.qi has arrived. ATTN pin fired");
+
+    J *req = notecard.newRequest("note.add");
+    if (req != NULL) {
+      JAddStringToObject(req, "file", "temperature.qo");
+      JAddBoolToObject(req, "sync", true);
+      J *body = JAddObjectToObject(req, "body");
+      if (body != NULL) {
+        //iterate over key values pair in map
+        for (const auto &entry : tempHashMap) {
+          JAddNumberToObject(body, entry.first.c_str(), entry.second);
+        }
+      }
+      notecard.sendRequest(req);
     }
-    notecard.sendRequest(req);
+    //enable routertemp task after the receive call back task
+    // has been executed. Allowing them to run simulataneously
+    // was causing issues.
+    taskSendRouterTemp.enable();
+    //rearm
+    debugln("rearming ATTN PIN.");
+    req = NoteNewRequest("card.attn");
+    JAddStringToObject(req, "mode", "arm");  // make the attn pin always HIGH at setup.
+    notecard.sendRequestWithRetry(req, 5);   // 5 secondsd
+    debugln("ATTN PIN is armed(LOW)");
   }
-  taskSendRouterTemp.enable();
 }
 
 void newConnectionCallback(uint32_t nodeId) {
@@ -110,13 +129,15 @@ void setup() {
   // Set up for debug output (if available).
   // If you open Arduino's serial terminal window, you'll be able to watch
   // JSON objects being transferred to and from the Notecard for each request.
-  Wire.begin(16, 17);  // SDA and SCL pins
+  Wire.begin(19, 21);  // SDA and SCL pins
   Serial.begin(115200);
   usbSerial.begin(115200);
+
+  pinMode(ATTN_PIN, INPUT_PULLDOWN);
 #if DEBUG == 1
   mesh.setDebugMsgTypes(ERROR | MESH_STATUS | CONNECTION | SYNC | COMMUNICATION | GENERAL | MSG_TYPES | REMOTE | STARTUP);  // all types on
 #else
-  mesh.setDebugMsgTypes( ERROR | STARTUP );  // set before init() so that you can see startup messages
+  mesh.setDebugMsgTypes(ERROR | STARTUP);  // set before init() so that you can see startup messages
 #endif
 
   mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
@@ -154,16 +175,32 @@ void setup() {
   // instead only sample its sensors occasionally, and would only upload to
   // the service on a "periodic" basis.
   JAddStringToObject(req, "mode", "continuous");
-
+  JAddNumberToObject(req, "inbound", 1);  // check notehub for any inbound notes every minute
   notecard.sendRequestWithRetry(req, 5);  // 5 seconds
+
+  req = NoteNewRequest("card.attn");
+  JAddStringToObject(req, "mode", "disarm");  // make the attn pin always HIGH at setup.
+  notecard.sendRequestWithRetry(req, 5);      // 5 seconds
+
+  //now arm it,
+  req = NoteNewRequest("card.attn");
+  JAddStringToObject(req, "mode", "arm, files");  // attn pin will now be low because I have armed it
+
+  // when the blynk.qi file arrives it will make the attn pin HIGH
+  J *files = JAddArrayToObject(req, "files");
+  // for downstream from blynk, they are written to an inbound note blynk.qi
+  JAddItemToArray(files, JCreateString("blynk.qi"));
+
+
+  notecard.sendRequestWithRetry(req, 5);
 
   userScheduler.addTask(taskSendMessage);
   userScheduler.addTask(taskSendRouterTemp);
   taskSendMessage.enable();
-  
 }
 
 
 void loop() {
+
   mesh.update();
 }

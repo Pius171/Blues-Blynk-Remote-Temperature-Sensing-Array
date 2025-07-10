@@ -1,5 +1,10 @@
 #include <Notecard.h>
 #include "painlessMesh.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// Data wire is plugged into IO4 on the ESP32
+#define ONE_WIRE_BUS 4
 
 #define DEBUG 1
 
@@ -14,6 +19,11 @@
 #define debugf(...)
 #endif
 
+// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
+OneWire oneWire(ONE_WIRE_BUS);
+
+// Pass our oneWire reference to Dallas Temperature.
+DallasTemperature sensors(&oneWire);
 
 #define usbSerial Serial
 
@@ -27,66 +37,101 @@
 
 // This is the unique Product Identifier for your device
 #ifndef PRODUCT_UID
-#define PRODUCT_UID "com.gmail.onyemandukwu:temperature_monitor"  // "com.my-company.my-name:my-project"
+#define PRODUCT_UID "com.gmail.onyemandukwu:temperature_monitor"  // change to your own PRODUCT UID
 #pragma message "PRODUCT_UID is not defined in this example. Please ensure your Notecard has a product identifier set before running this example or define it in code here. More details at https://dev.blues.io/tools-and-sdks/samples/product-uid"
 #endif
 
 #define myProductID PRODUCT_UID
-#define ATTN_PIN 16
+
+/* The cellular notecard by default uses its embedded
+*  SIM which comes with 500MB and 10 years worth of 
+*  cellular service, but is not available in all regions
+*  If it is not available in your region you can use an 
+* external SIM card.
+*/
+#define USING_EXTERNAL_SIM true  // chnange to false if using the embedded SIM card
+
+#define ATTN_PIN 18
+#define LED 16
+#define SDA 19
+#define SDL 21
 #define MESH_PREFIX "whateverYouLike"
 #define MESH_PASSWORD "somethingSneaky"
 #define MESH_PORT 5555
-
-const String DEVICE_NAME = "Room 199";  // case sensitive
-const int INTERVAL = 1;                 // in seconds check to 60 secs later //remove since it will stop sending periodically
+#define HIDDEN true
+#define CHANNEL 1
+#define MAX_DEVICES 26  // max number of devices
 
 Scheduler userScheduler;  // to control your personal task
 painlessMesh mesh;
 Notecard notecard;
 
 std::map<String, int> tempHashMap;
+std::map<uint32_t, bool> IDmap;
 // User stub
 void sendMessage();
 void sendRouterTemp();
 
 Task taskSendMessage(TASK_SECOND * 1, TASK_FOREVER, &sendMessage);
-Task taskSendRouterTemp(TASK_SECOND * 1, TASK_FOREVER, &sendRouterTemp);
 
 void sendMessage() {
   String msg = String(mesh.getNodeId());
   mesh.sendBroadcast(msg);  // sends its id to non router devices, so they can know where to send thier temp reading to
-
-  taskSendMessage.setInterval(TASK_SECOND * INTERVAL);
+  taskSendMessage.setInterval(TASK_SECOND * 1);
 }
 
-void sendRouterTemp() {
-  // send its own temperature to the cloud
-  int temperature = random(32);
-
-  J *req = notecard.newRequest("note.add");
-  if (req != NULL) {
-    JAddStringToObject(req, "file", "temperature.qo");
-    JAddBoolToObject(req, "sync", true);
-    J *body = JAddObjectToObject(req, "body");
-    if (body != NULL) {
-      JAddNumberToObject(body, DEVICE_NAME.c_str(), temperature);
-    }
-    notecard.sendRequest(req);
-  }
-  taskSendRouterTemp.setInterval(TASK_SECOND * 2);
-  taskSendRouterTemp.disable();
-}
 
 // Needed for painless library
 void receivedCallback(uint32_t from, String &msg) {
-  debugf("startHere: Received from %u msg=%s\n", from, msg.c_str());
-  int temperature = msg.substring(0, 2).toInt();
-  String device_name = msg.substring(2);
 
-  tempHashMap[device_name] = temperature;
+  debugf("startHere: Received from %u msg=%s\n", from, msg.c_str());
+  char *deviceName = nullptr;  // pointer to hold device name
+
+  try {
+    bool deviceNamed = IDmap.at(from);
+    if (!deviceNamed) {
+      J *req = notecard.newRequest("env.get");
+      JAddStringToObject(req, "name", String(from).c_str());
+      J *rsp = notecard.requestAndResponse(req);
+      debugln(JConvertToJSONString(rsp));
+
+      deviceName = JGetString(rsp, "text");
+
+      if (deviceName == "") {
+        // ID does not exist in environmental variable
+        debugf("\n%u does not exist in env\n", from);
+        deviceName = strdup(String(from).c_str());
+
+      } else {
+        // device has gotten its name from environmental variable
+        IDmap[from] = true;
+      }
+      debugln(deviceName);
+    } else {
+      // if the device is named remove its duplicate from the
+      // tempHashMap
+      tempHashMap.erase(String(from));
+    }
+  } catch (const std::out_of_range &e) {
+    // id does not exist, adding to map
+    debugf("%u does not exist in IDmap, adding to map\n", from);
+    IDmap[from] = false;
+  }
+
+
+  int temperature = msg.toInt();
+  tempHashMap[deviceName] = temperature;
+
+  debug("getting router temperature...");
+  sensors.requestTemperatures();  // Send the command to get temperatures
+  debugln("DONE");
+
+  int routerTempC = (int)sensors.getTempCByIndex(0);
+  tempHashMap["Router"] = routerTempC;  // add router temperature to hashmap
 
   if (digitalRead(ATTN_PIN)) {
     debugln("blynk.qi has arrived. ATTN pin fired");
+
 
     J *req = notecard.newRequest("note.add");
     if (req != NULL) {
@@ -101,10 +146,7 @@ void receivedCallback(uint32_t from, String &msg) {
       }
       notecard.sendRequest(req);
     }
-    //enable routertemp task after the receive call back task
-    // has been executed. Allowing them to run simulataneously
-    // was causing issues.
-    taskSendRouterTemp.enable();
+
     //rearm
     debugln("rearming ATTN PIN.");
     req = NoteNewRequest("card.attn");
@@ -112,6 +154,7 @@ void receivedCallback(uint32_t from, String &msg) {
     notecard.sendRequestWithRetry(req, 5);   // 5 secondsd
     debugln("ATTN PIN is armed(LOW)");
   }
+  free(deviceName);
 }
 
 void newConnectionCallback(uint32_t nodeId) {
@@ -129,23 +172,26 @@ void setup() {
   // Set up for debug output (if available).
   // If you open Arduino's serial terminal window, you'll be able to watch
   // JSON objects being transferred to and from the Notecard for each request.
-  Wire.begin(19, 21);  // SDA and SCL pins
+  Wire.begin(SDA, SDL);  // SDA and SCL pins
   Serial.begin(115200);
   usbSerial.begin(115200);
 
   pinMode(ATTN_PIN, INPUT_PULLDOWN);
+  pinMode(LED, OUTPUT);
+  //digitalWrite(LED, 1);
 #if DEBUG == 1
   mesh.setDebugMsgTypes(ERROR | MESH_STATUS | CONNECTION | SYNC | COMMUNICATION | GENERAL | MSG_TYPES | REMOTE | STARTUP);  // all types on
 #else
   mesh.setDebugMsgTypes(ERROR | STARTUP);  // set before init() so that you can see startup messages
 #endif
 
-  mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
+  mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT, WIFI_AP_STA, CHANNEL, HIDDEN, MAX_DEVICES);
   mesh.onReceive(&receivedCallback);
   mesh.onNewConnection(&newConnectionCallback);
   mesh.onChangedConnections(&changedConnectionCallback);
   mesh.onNodeTimeAdjusted(&nodeTimeAdjustedCallback);
-
+  // Bridge node, should (in most cases) be a root node. See [the wiki](https://gitlab.com/painlessMesh/painlessMesh/wikis/Possible-challenges-in-mesh-formation) for some background
+  mesh.setRoot(true);
 
 
   const size_t usb_timeout_ms = 3000;
@@ -178,12 +224,12 @@ void setup() {
   JAddNumberToObject(req, "inbound", 1);  // check notehub for any inbound notes every minute
   notecard.sendRequestWithRetry(req, 5);  // 5 seconds
 
-  req = NoteNewRequest("card.attn");
+  req = notecard.newRequest("card.attn");
   JAddStringToObject(req, "mode", "disarm");  // make the attn pin always HIGH at setup.
   notecard.sendRequestWithRetry(req, 5);      // 5 seconds
 
   //now arm it,
-  req = NoteNewRequest("card.attn");
+  req = notecard.newRequest("card.attn");
   JAddStringToObject(req, "mode", "arm, files");  // attn pin will now be low because I have armed it
 
   // when the blynk.qi file arrives it will make the attn pin HIGH
@@ -194,13 +240,60 @@ void setup() {
 
   notecard.sendRequestWithRetry(req, 5);
 
+
+
+
+#if USING_EXTERNAL_SIM
+  req = notecard.newRequest("card.wireless");
+  JAddStringToObject(
+    req,
+    "apn",
+    "web.gprs.mtnnigeria.net"  // change this to your SIM access point name
+  );
+
+
+  /* set the mode you want your SIM to use
+  *  for connectivity:
+  *   "-" to reset to the default mode.
+  *  "auto" to perform automatic band scan mode (this is the default mode).
+  *  "m" to restrict the modem to Cat-M1.
+  *  "nb" to restrict the modem to Cat-NB1.
+  *  "gprs" to restrict the modem to EGPRS
+  */
+  JAddStringToObject(req, "mode", "gprs");  // only gprs worked in my region
+#else
+  req = NoteNewRequest("card.wireless");
+  JAddStringToObject(
+    req,
+    "apn",
+    "-"  // reverts to embedded SIM
+  );
+
+
+  /* set the mode you want your SIM to use
+  *  for connectivity:
+  *   "-" to reset to the default mode.
+  *  "auto" to perform automatic band scan mode (this is the default mode).
+  *  "m" to restrict the modem to Cat-M1.
+  *  "nb" to restrict the modem to Cat-NB1.
+  *  "gprs" to restrict the modem to EGPRS
+  */
+  JAddStringToObject(req, "mode", "-");  // reverts to embedded SIM
+  notecard.sendRequestWithRetry(req, 5);
+#endif
   userScheduler.addTask(taskSendMessage);
-  userScheduler.addTask(taskSendRouterTemp);
   taskSendMessage.enable();
 }
 
 
 void loop() {
-
+  int mesh_size = mesh.getNodeList().size();
+  if (mesh_size > 0) {
+    // turn on LED to indicate there is a non router connected
+    digitalWrite(LED, 0);  // led is active low
+    //debugln(x)
+  } else {
+    digitalWrite(LED, 1);
+  }
   mesh.update();
 }

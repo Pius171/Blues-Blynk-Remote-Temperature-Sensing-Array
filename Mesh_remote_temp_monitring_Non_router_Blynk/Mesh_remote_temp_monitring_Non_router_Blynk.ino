@@ -1,127 +1,135 @@
+//************************************************************
+// this is a simple example that uses the painlessMesh library
+//
+// 1. sends a silly message to every node on the mesh at a random time between 1 and 5 seconds
+// 2. prints anything it receives to Serial.print
+//
+//
+//************************************************************
 #include "painlessMesh.h"
 #include "FS.h"
-#include <OneWire.h>
-#include <DallasTemperature.h>
-#include <map>
+#include "LittleFS.h"
 
-// Data wire is plugged into port 2 on the Arduino
-#define ONE_WIRE_BUS 4
+#define   MESH_PREFIX     "whateverYouLike"
+#define   MESH_PASSWORD   "somethingSneaky"
+#define   MESH_PORT       5555
 
-//LED for debugging
-#define LED 16
-
-#define MESH_PREFIX "whateverYouLike"
-#define MESH_PASSWORD "somethingSneaky"
-#define MESH_PORT 5555
-
-#define DEBUG 1
-
-#if DEBUG == 1
-#define debug(x) Serial.print(x)
-#define debugln(x) Serial.println(x)
-#define debugf(...) Serial.printf(__VA_ARGS__)  // Use variadic macros to allow multiple arguments
-
-#else
-#define debug(x)
-#define debugln(x)
-#define debugf(...)
-#endif
-
-// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
-OneWire oneWire(ONE_WIRE_BUS);
-
-// Pass our oneWire reference to Dallas Temperature.
-DallasTemperature sensors(&oneWire);
-
-Scheduler userScheduler;  // to control your personal task
-painlessMesh mesh;
+Scheduler userScheduler; // to control your personal task
+painlessMesh  mesh;
 
 bool RouterExists = false;
-uint32_t router = 0;
-const String DEVICE_NAME = "Room 200";  // should be different for each device and should match your blynk datastream.
-const int INTERVAL = 5;                 // in seconds
+uint32_t router=0;
 
 // User stub
-void sendMessage();  // Prototype so PlatformIO doesn't complain
+void sendMessage() ; // Prototype so PlatformIO doesn't complain
+String readFile(String path);
+void writeFile(const char * path, String message);
 
-
-Task taskSendMessage(TASK_SECOND * 1, TASK_FOREVER, &sendMessage);
+Task taskSendMessage( TASK_SECOND * 1 , TASK_FOREVER, &sendMessage );
 
 void sendMessage() {
-  debug("getting temperature...");
-  sensors.requestTemperatures();  // Send the command to get temperatures
-  debugln("DONE");
-  // After we got the temperatures, we can print them here.
-  // We use the function ByIndex, and as an example get the temperature from the first sensor only.
-  int tempC = (int)sensors.getTempCByIndex(0);
-  // char msg[50];
-  // sprintf(msg, "%02d%s", tempC, DEVICE_NAME.c_str());
- // debugln(msg);
+  String temperature = String(random(32));
+  //mesh.sendBroadcast( temperature );
+  if(RouterExists){
+  mesh.sendSingle(router,temperature);
+  Serial.print("router: ");
+  Serial.println(router);
+  taskSendMessage.setInterval( random( TASK_SECOND * 1, TASK_SECOND * 5 ));
 
-
-  if (RouterExists) {
-digitalWrite(LED,1);// turn on LED
-    if (!mesh.sendSingle(router, String(tempC))) {
-      // debugf("failed to send %s", msg);
-      debugln("failed to send temperature");
-      RouterExists=false;
-      digitalWrite(LED, 0);  // turn off LED
-    }
-    // debug("router: ");
-    // debugln(router);
-    debugf("sent %d C to %d(Router)\n",tempC,router);
-    taskSendMessage.setInterval(TASK_SECOND * INTERVAL);
-  }
-  else{
-  digitalWrite(LED,0);// turn off LED if router does not exist
   }
 }
 
 // Needed for painless library
-void receivedCallback(uint32_t from, String &msg) {
-  debugf("startHere: Received from %u msg=%s\n", from, msg.c_str());
-router = from;
-  RouterExists = true;
+void receivedCallback( uint32_t from, String &msg ) {
+  Serial.printf("startHere: Received from %u msg=%s\n", from, msg.c_str());
+  if(!RouterExists){
+    Serial.println("no router finding router");
+   router=from;
+     Serial.print("router: ");
+  Serial.println(router);
+   writeFile("/masterID.txt",String(from));
+   RouterExists=true;
+  }
 
 }
 
 void newConnectionCallback(uint32_t nodeId) {
-  debugf("--> startHere: New Connection, nodeId = %u\n", nodeId);
+    Serial.printf("--> startHere: New Connection, nodeId = %u\n", nodeId);
 }
 
 void changedConnectionCallback() {
-  debugf("Changed connections\n");
+  Serial.printf("Changed connections\n");
 }
 
 void nodeTimeAdjustedCallback(int32_t offset) {
-  debugf("Adjusted time %u. Offset = %d\n", mesh.getNodeTime(), offset);
+    Serial.printf("Adjusted time %u. Offset = %d\n", mesh.getNodeTime(),offset);
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(LED, OUTPUT);
-#if DEBUG == 1
-  mesh.setDebugMsgTypes(ERROR | MESH_STATUS | CONNECTION | SYNC | COMMUNICATION | GENERAL | MSG_TYPES | REMOTE);  // all types on
-#else
-  mesh.setDebugMsgTypes(ERROR | STARTUP);  // set before init() so that you can see startup messages
-#endif
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS Mount Failed");
+    return;
+  }
 
-  mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
+    if (LittleFS.exists("/masterID.txt")) {
+    RouterExists= true;
+    router= readFile("/masterID.txt").toInt();
+    Serial.print("router: ");
+    Serial.println(router);
+ 
+  }
+//mesh.setDebugMsgTypes( ERROR | MESH_STATUS | CONNECTION | SYNC | COMMUNICATION | GENERAL | MSG_TYPES | REMOTE ); // all types on
+  mesh.setDebugMsgTypes( ERROR | STARTUP );  // set before init() so that you can see startup messages
+
+  mesh.init( MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT );
   mesh.onReceive(&receivedCallback);
   mesh.onNewConnection(&newConnectionCallback);
   mesh.onChangedConnections(&changedConnectionCallback);
   mesh.onNodeTimeAdjusted(&nodeTimeAdjustedCallback);
 
-    // This node and all other nodes should ideally know the mesh contains a root, so call this on all nodes
-  mesh.setContainsRoot(true);
-
-  userScheduler.addTask(taskSendMessage);
+  userScheduler.addTask( taskSendMessage );
   taskSendMessage.enable();
-  sensors.begin();
 }
 
 void loop() {
   // it will run the user scheduler as well
-
   mesh.update();
+}
+
+void writeFile(const char * path, String message){
+    Serial.printf("Writing file: %s\n", path);
+
+    File file = LittleFS.open(path, "w");
+    if(!file){
+        Serial.println("Failed to open file for writing");
+        return;
+    }
+    if(file.print(message)){
+        Serial.println("File written");
+    } else {
+        Serial.println("Write failed");
+    }
+    file.close();
+}
+
+String readFile(String path) {
+  String DoC = "";
+  Serial.print("Reading file: %s\n");
+  Serial.println(path);
+
+  File file = LittleFS.open(path, "r");
+  if (!file) {
+    Serial.println("Failed to open file for reading");
+    return DoC;
+  }
+
+  Serial.print("Read from file: ");
+  while (file.available()) {
+
+    DoC += file.readString();
+    Serial.print(DoC);
+    //delay(500);
+  }
+  return DoC;
 }
